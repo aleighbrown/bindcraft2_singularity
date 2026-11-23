@@ -1,0 +1,81 @@
+# .github/workflows/bindcraft-image.yml
+#
+# Builds the BindCraft2 image and pushes it to ghcr.io, from where an unprivileged
+# `singularity pull` can convert it on the cluster. Run it from the Actions tab.
+#
+# Why the odd-looking steps:
+#   - the runner is cleared of preinstalled SDKs first, because jax + cuDNN wheels make an
+#     image in the 6-10 GB range and a stock ubuntu-latest runner does not have room for it;
+#   - provenance and SBOM attestations are turned off, because they turn the pushed tag into
+#     an OCI index that SingularityCE 3.x refuses to pull.
+
+name: bindcraft image
+
+on:
+  workflow_dispatch:
+    inputs:
+      accelerator:
+        description: "Accelerator wheels. cuda12 for driver 525-57x; cuda13 needs driver 580+ and compute capability 7.5+."
+        type: choice
+        options: [cuda12, cuda13]
+        default: cuda12
+      bindcraft_ref:
+        description: "BindCraft2 branch, tag or commit to build."
+        type: string
+        default: main
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # ~25 GB, which is the difference between this building and failing on no space left.
+      - name: Reclaim runner disk
+        run: |
+          sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/lib/android \
+                      /usr/local/share/boost /usr/local/.ghcup /opt/hostedtoolcache
+          sudo docker image prune --all --force
+          df -h /
+
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # ghcr rejects uppercase in a repository path, and a GitHub username may contain it.
+      - name: Resolve image name
+        id: image
+        run: echo "name=ghcr.io/$(echo '${{ github.repository_owner }}' | tr '[:upper:]' '[:lower:]')/bindcraft" >> "$GITHUB_OUTPUT"
+
+      - name: Build and push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./Dockerfile
+          platforms: linux/amd64
+          push: true
+          provenance: false
+          sbom: false
+          build-args: |
+            ACCELERATOR=${{ inputs.accelerator }}
+            BINDCRAFT_REF=${{ inputs.bindcraft_ref }}
+          tags: |
+            ${{ steps.image.outputs.name }}:${{ inputs.accelerator }}
+            ${{ steps.image.outputs.name }}:${{ inputs.accelerator }}-${{ github.run_number }}
+
+      - name: How to pull it
+        run: |
+          echo "singularity pull bindcraft.sif docker://${{ steps.image.outputs.name }}:${{ inputs.accelerator }}"
+          echo
+          echo "If the pull asks for credentials, the package is still private."
+          echo "Either make it public under Packages -> bindcraft -> Package settings,"
+          echo "or export SINGULARITY_DOCKER_USERNAME and SINGULARITY_DOCKER_PASSWORD"
+          echo "with a read:packages personal access token."
